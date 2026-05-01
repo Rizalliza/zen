@@ -20,14 +20,11 @@ const {
 } = require('../utilities/poolContract');
 const {
     extractPools: extractPoolsFromPayload,
-} = require('../utilities/triangleRouteCore');
-const {
-    calculateQuotePriceMetrics,
-} = require('../utilities/priCeDiff&impact');
+} = require('./triangleRouteCore');
 
 const SOL = 'So11111111111111111111111111111111111111112';
 const USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
-const DEFAULT_SLIPPAGE_BPS = 20;
+const DEFAULT_SLIPPAGE_BPS = 50;
 
 const short = (s) => s ? `${s.slice(0, 6)}..${s.slice(-4)}` : '?';
 
@@ -283,7 +280,6 @@ function summarizePool(pool, pairLabel = '') {
         vaults: pool?.vaults || null,
         tickSpacing: pool?.tickSpacing ?? null,
         tickCurrent: pool?.tickCurrent ?? pool?.tickCurrentIndex ?? null,
-        tickDepth: pool?.tickDepth ?? null,
         tickArrays: Array.isArray(pool?.tickArrays) ? pool.tickArrays : [],
         tickArrayData: Array.isArray(pool?.tickArrayData) ? pool.tickArrayData : [],
         remainingAccounts: Array.isArray(pool?.remainingAccounts) ? pool.remainingAccounts : [],
@@ -291,24 +287,6 @@ function summarizePool(pool, pairLabel = '') {
         sqrtPrice: pool?.sqrtPrice ?? pool?.sqrtPriceX64 ?? null,
         sqrtPriceX64: pool?.sqrtPriceX64 ?? pool?.sqrtPrice ?? null,
         currentPrice: pool?.currentPrice ?? pool?._raw?.current_price ?? pool?._raw?.price ?? null,
-        pairCanonical: pool?.pairCanonical ?? null,
-        pairLabel: pool?.pairLabel ?? pairLabel ?? null,
-        pairBaseMint: pool?.pairBaseMint ?? null,
-        pairQuoteMint: pool?.pairQuoteMint ?? null,
-        pairBaseSymbol: pool?.pairBaseSymbol ?? null,
-        pairQuoteSymbol: pool?.pairQuoteSymbol ?? null,
-        pairOrientation: pool?.pairOrientation ?? null,
-        pairPeerCount: pool?.pairPeerCount ?? 0,
-        pairComparablePeerCount: pool?.pairComparablePeerCount ?? 0,
-        pairMidPrice: pool?.pairMidPrice ?? null,
-        pairMedianMid: pool?.pairMedianMid ?? null,
-        pairBestMid: pool?.pairBestMid ?? null,
-        pairWorstMid: pool?.pairWorstMid ?? null,
-        pairDivergenceBps: pool?.pairDivergenceBps ?? 0,
-        pairDivergenceComparable: pool?.pairDivergenceComparable ?? null,
-        pairMidDeviationBps: pool?.pairMidDeviationBps ?? 0,
-        pairSpreadPosition: pool?.pairSpreadPosition ?? null,
-        pairMidExtractionSource: pool?.pairMidExtractionSource ?? null,
         binStep: pool?.binStep ?? null,
         activeBinId: pool?.activeBinId ?? pool?.activeId ?? null,
         bins: Array.isArray(pool?.bins) ? pool.bins : [],
@@ -826,31 +804,6 @@ class SwapSimulator {
                 inDecimals: orientation.inputDecimals,
                 outDecimals: orientation.outputDecimals,
             };
-            const priceMetrics = calculateQuotePriceMetrics({
-                pool,
-                inputMint: orientation.tokenInMint,
-                outputMint: orientation.tokenOutMint,
-                inputAmountRaw: quoteEnvelope.inAmountRaw,
-                outputAmountRaw: quoteEnvelope.outAmountRaw,
-                inputDecimals: orientation.inputDecimals,
-                outputDecimals: orientation.outputDecimals,
-                quoteImpact: quote.priceImpact,
-                feeBps: quoteEnvelope.feeBps,
-            });
-            if (priceMetrics.impactPct != null) {
-                quoteEnvelope.priceImpact = Number((priceMetrics.impactPct / 100).toFixed(8));
-                quoteEnvelope.impactPct = priceMetrics.impactPct;
-                quoteEnvelope.impactBps = priceMetrics.impactBps;
-            }
-            quoteEnvelope.grossImpactPct = priceMetrics.grossImpactPct ?? null;
-            quoteEnvelope.feePct = priceMetrics.feePct ?? null;
-            quoteEnvelope.tradeRatioPct = priceMetrics.tradeRatioPct ?? null;
-            quoteEnvelope.midPrice = priceMetrics.midPrice ?? null;
-            quoteEnvelope.feeAdjustedMidPrice = priceMetrics.feeAdjustedMidPrice ?? null;
-            quoteEnvelope.executionPrice = priceMetrics.executionPrice ?? null;
-            quoteEnvelope.priceDiff = null;
-            quoteEnvelope.priceDiffBps = null;
-            quoteEnvelope.priceDiffSource = 'runtime-single-leg-no-peer-comparison';
 
             const contract = validateQuoteContract(quoteEnvelope);
             if (!contract.valid) {
@@ -982,13 +935,6 @@ class SwapChainSimulator {
         const finalBI = BigInt(currentAmount);
         const profitBI = finalBI - startBI;
         const profitBps = startBI > 0n ? Number((profitBI * 10000n) / startBI) : 0;
-        const sumFeeBps = quotedLegs.reduce((sum, leg) => sum + toFiniteNumber(leg.feeBps, 0), 0);
-        const sumImpactBps = quotedLegs.reduce((sum, leg) => {
-            if (leg.impactBps != null) return sum + toFiniteNumber(leg.impactBps, 0);
-            if (leg.impactPct != null) return sum + (toFiniteNumber(leg.impactPct, 0) * 100);
-            return sum + (toFiniteNumber(leg.priceImpact, 0) * 10000);
-        }, 0);
-        const sumTradeRatioPct = quotedLegs.reduce((sum, leg) => sum + toFiniteNumber(leg.tradeRatioPct, 0), 0);
         const routePath = quotedLegs[0]?.routePath || quotedLegs.map((leg) => short(leg.tokenInMint)).join(' → ');
         const path = [
             quotedLegs[0]?.tokenInMint || null,
@@ -1014,110 +960,8 @@ class SwapChainSimulator {
             type: leg.type,
             ...classifyQuoteExecutionQuality(leg),
         }));
-        const executionLegs = quotedLegs.map((leg) => ({
-            legIndex: leg.legIndex,
-            label: leg.label || leg.pairLabel || null,
-            poolAddress: leg.poolAddress,
-            dexType: leg.dexType,
-            type: leg.type,
-            tokenInMint: leg.tokenInMint,
-            tokenOutMint: leg.tokenOutMint,
-            inputAmount: leg.inAmountRaw,
-            expectedOutputAmount: leg.outAmountRaw,
-            minOutputAmount: leg.minOutAmountRaw,
-            swapForY: leg.swapForY,
-            swapDirection: leg.swapDirection,
-            inputDecimals: leg.inputDecimals,
-            outputDecimals: leg.outputDecimals,
-            feeBps: leg.feeBps,
-            priceImpact: leg.priceImpact,
-            impactPct: leg.impactPct,
-            impactBps: leg.impactBps,
-            grossImpactPct: leg.grossImpactPct,
-            feePct: leg.feePct,
-            tradeRatioPct: leg.tradeRatioPct,
-            priceDiff: leg.priceDiff,
-            priceDiffBps: leg.priceDiffBps,
-            priceDiffSource: leg.priceDiffSource,
-            tickDepth: leg.tickDepth || null,
-            quoteSource: leg.quoteSource || null,
-            tickStrategy: leg.tickStrategy || null,
-            tickArrays: leg.tickArrays || [],
-            binArrays: leg.binArrays || [],
-            binStep: leg.binStep ?? null,
-            activeBinId: leg.activeBinId ?? null,
-            executionQuality: classifyQuoteExecutionQuality(leg),
-        }));
-        // after quoting all 3 legs:
-        const grossYieldBps = profitBps + sumFeeBps + sumImpactBps;
-        const edgeMinusFeesBps = grossYieldBps - sumFeeBps;
-        if (grossYieldBps < 0) {
-            return {
-                success: true,
-                routeId: quotedLegs[0]?.routeId || `tri-${Date.now()}`,
-                routePath,
-                startAmount: String(parsed.startAmount),
-                finalAmount: currentAmount,
-                profitLamports: profitBI.toString(),
-                profitBps,
-                sumFeeBps,
-                sumImpactBps,
-                sumTradeRatioPct,
-                grossYieldBps,
-                grossEdgeBps: grossYieldBps,
-                edgeMinusFeesBps,
-                profitable: false,
-                executionEligible: false,
-                executionQuality: 'diagnostic-only',
-                path,
-                legs: quotedLegs,
-                gateReason: 'Negative pre-fee yield (stale or contradictory quotes)',
-                execution: {
-                    executable: false,
-                    qualityTier: 'diagnostic-only',
-                    rejectedByGate: true,
-                    gateReasons: [{
-                        reason: 'Negative pre-fee yield (stale or contradictory quotes)',
-                    }],
-                    legs: executionLegs,
-                },
-            };
-        }
         const rejectedLegs = legQualities.filter((entry) => !entry.executable);
-        const totalFeeBps = sumFeeBps;
-        const latencySlippageBps = toFiniteNumber(parsed.opts?.latencySlippageBps, 0);
-        const explicitJitoTipBps = parsed.opts?.jitoTipBps == null
-            ? null
-            : toFiniteNumber(parsed.opts.jitoTipBps, 0);
-        const jitoTipLamports = toBigIntSafe(parsed.opts?.jitoTipLamports, 0n);
-        const jitoTipBps = explicitJitoTipBps == null
-            ? (startBI > 0n ? Number((jitoTipLamports * 10000n) / startBI) : 0)
-            : explicitJitoTipBps;
-        const requiredEdgeBps = totalFeeBps + latencySlippageBps + jitoTipBps;
-        const rejectedByProfitabilityGate = profitBps < requiredEdgeBps;
-        const profitabilityGateReason = rejectedByProfitabilityGate
-            ? {
-                reason: 'Profit below required execution edge',
-                profitBps,
-                requiredEdgeBps,
-                totalFeeBps,
-                latencySlippageBps,
-                jitoTipBps,
-            }
-            : null;
-        const gateReasons = [
-            ...rejectedLegs.map((entry) => ({
-                legIndex: entry.legIndex,
-                poolAddress: entry.poolAddress,
-                dexType: entry.dexType,
-                type: entry.type,
-                reason: entry.gateReason,
-                quoteSource: entry.quoteSource,
-                tickStrategy: entry.tickStrategy,
-            })),
-            ...(profitabilityGateReason ? [profitabilityGateReason] : []),
-        ];
-        const executionEligible = gateReasons.length === 0;
+        const executionEligible = rejectedLegs.length === 0;
 
         return {
             success: true,
@@ -1127,17 +971,7 @@ class SwapChainSimulator {
             finalAmount: currentAmount,
             profitLamports: profitBI.toString(),
             profitBps,
-            sumFeeBps,
-            sumImpactBps,
-            sumTradeRatioPct,
-            grossYieldBps,
-            grossEdgeBps: grossYieldBps,
-            edgeMinusFeesBps,
-            totalFeeBps,
-            latencySlippageBps,
-            jitoTipBps,
-            requiredEdgeBps,
-            profitable: profitBI > 0n && !rejectedByProfitabilityGate,
+            profitable: profitBI > 0n,
             executionEligible,
             executionQuality: executionEligible ? 'execution-grade' : 'diagnostic-only',
             path,
@@ -1146,8 +980,39 @@ class SwapChainSimulator {
                 executable: executionEligible,
                 qualityTier: executionEligible ? 'execution-grade' : 'diagnostic-only',
                 rejectedByGate: !executionEligible,
-                gateReasons,
-                legs: executionLegs,
+                gateReasons: rejectedLegs.map((entry) => ({
+                    legIndex: entry.legIndex,
+                    poolAddress: entry.poolAddress,
+                    dexType: entry.dexType,
+                    type: entry.type,
+                    reason: entry.gateReason,
+                    quoteSource: entry.quoteSource,
+                    tickStrategy: entry.tickStrategy,
+                })),
+                legs: quotedLegs.map((leg) => ({
+                    legIndex: leg.legIndex,
+                    label: leg.label || leg.pairLabel || null,
+                    poolAddress: leg.poolAddress,
+                    dexType: leg.dexType,
+                    type: leg.type,
+                    tokenInMint: leg.tokenInMint,
+                    tokenOutMint: leg.tokenOutMint,
+                    inputAmount: leg.inAmountRaw,
+                    expectedOutputAmount: leg.outAmountRaw,
+                    minOutputAmount: leg.minOutAmountRaw,
+                    swapForY: leg.swapForY,
+                    swapDirection: leg.swapDirection,
+                    inputDecimals: leg.inputDecimals,
+                    outputDecimals: leg.outputDecimals,
+                    feeBps: leg.feeBps,
+                    quoteSource: leg.quoteSource || null,
+                    tickStrategy: leg.tickStrategy || null,
+                    tickArrays: leg.tickArrays || [],
+                    binArrays: leg.binArrays || [],
+                    binStep: leg.binStep ?? null,
+                    activeBinId: leg.activeBinId ?? null,
+                    executionQuality: classifyQuoteExecutionQuality(leg),
+                })),
             },
         };
     }

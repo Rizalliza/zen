@@ -19,7 +19,7 @@ const {
   extractPools: extractPoolsFromPayload,
   extractChainRoutes: extractChainRoutesFromPayload,
   getPoolSymbolForMint,
-} = require('../utilities/triangleRouteCore');
+} = require('./triangleRouteCore');
 const { processInBatches } = require('../utilities/batchProcess');
 const { createRpcConnection, getConfiguredRpcUrls } = require('../utilities/rpcConnectionManager');
 const {
@@ -1170,8 +1170,8 @@ if (require.main === module) {
 /*
 Canonical numbered runtime sequence:
 
-node utilities/poolFetchCustom_raw.js --out 01_meta.json --raw 00_raw.json
-node utilities/divergenceScanner.js --in 01_meta.json --out 02_filtered.json
-node engine/Q_enrichment.js --in 02_filtered.json --out 03_enriched.json
+node utilities/poolFetchCustom_raw.js --out 01_meta.json --raw 00_raw.json --max-per-dex-type 15 --quality 60
+node engine/Q_enrichment.js --in 01_meta.json --out 02_enriched.json
+node utilities/divergenceScanner.js --in 02_enriched.json --out 03_filtered.json
 node engine/myEngine.js --in 03_enriched.json --out 04_runtimeResults.json --csv 05_result_compare.csv --json 06_result_data.json --html 07_result_report.html
 */

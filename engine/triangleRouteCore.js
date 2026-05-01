@@ -3,7 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const { mergeCanonicalPool, validatePoolContract } = require('./poolContract');
+const { mergeCanonicalPool, validatePoolContract } = require('../utilities/poolContract');
 
 const SOL = 'So11111111111111111111111111111111111111112';
 const USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
