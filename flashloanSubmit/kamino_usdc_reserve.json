@@ -1,0 +1,18 @@
+{
+  "_comment": "Kamino USDC reserve detail for flashloan execution. Fill in real addresses from Kamino API or on-chain data.",
+  "lendingMarket": "7u3HeHVY9rzDBjufT8KDKpNZCA7wRTkPnhy4c6cWBj9Z",
+  "lendingMarketAuthority": "Ei4anTzFBC2E6wTvnCmXGK45Lvsd4inRcFhjHYn57UaX",
+  "reserve": "<DERIVE_OR_FETCH_FROM_KAMINO>",
+  "reserveLiquidityMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  "reserveLiquiditySupply": "<DERIVE_OR_FETCH_FROM_KAMINO>",
+  "reserveLiquidityFeeReceiver": "<DERIVE_OR_FETCH_FROM_KAMINO>",
+  "userLiquidityAccount": "<YOUR_USDC_ATA>",
+  "kaminoProgramId": "KLend2g3cP87fffoSw8b1zWzGvNfRj6Q2uHvXN4e8fQ",
+  "_deriveReserve": "PDA of [lendingMarket, reserveLiquidityMint, 'reserve'] with Kamino program",
+  "_deriveLendingMarketAuthority": "PDA of [lendingMarket, 'authority'] with Kamino program",
+  "_howToGetRealData": [
+    "1. Use prepareKaminoReserve.js: node prepareKaminoReserve.js --market 7u3HeHVY9rzDBjufT8KDKpNZCA7wRTkPnhy4c6cWBj9Z --mint EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "2. Or fetch from Kamino API: GET https://api.kamino.finance/v2/reserves?mint=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "3. Or query on-chain: the reserve PDA is derived from [market, mint, 'reserve'] seeds"
+  ]
+}

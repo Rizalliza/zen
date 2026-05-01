@@ -1,0 +1,59 @@
+# OS/editor metadata
+.DS_Store
+.vscode/
+.qodo/
+.sixth/
+.zencoder/
+.zenflow/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.secret
+id_rsa*
+
+# Dependencies and package-manager caches
+node_modules/
+.npm/
+.yarn/
+.pnpm-store/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Runtime pool snapshots and simulation outputs
+all4runs.txt
+00_raw.json
+01_meta.json
+02_filtered.json
+03_enriched.json
+04_runtimeResults.json
+05_result_compare.csv
+06_result_data.json
+07_result_report.html
+custom_raw.json
+custom_quality-*.json
+divergence-ready.json
+enriched-*.json
+raw_runtime_results.json
+runtime_myengine_test_results*.json
+runtime_myengine_test_results*.csv
+runtime_myengine_test_results*.html
+*_runtime_results.json
+*_comparison.csv
+*_report.html
+*_report_data.json
+
+# Generated report/output folders
+Qseries/
+
+# Temporary files
+tmp/
+temp/
+.cache/
