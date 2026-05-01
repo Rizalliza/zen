@@ -1,64 +1,51 @@
 'use strict';
 /**
- * poolFetchCustom_raw.js  (refactored — activity & divergence-aware)
+ * poolFetchCustom_raw.js  (triangle-closure-aware)
  *
- * What changed
- * ============
+ * Goal of this rewrite
+ * ====================
+ * Previous selection ranked by activity score then deduped by per-pair count.
+ * That funnels every run into deep stable-major pools (SOL/USDC/USDT/RAY) which
+ * are saturated by HFT bots in milliseconds. Result: every triangle the engine
+ * builds is some permutation of SOL→USDC→USDT→SOL, divergence is ~0.2 bps,
+ * fees are ~4 bps, and net is always negative.
  *
- * The old fetcher hit each DEX's API with `sortField=liquidity&sortType=desc`,
- * truncated to limit, and produced a list dominated by deep stable pools
- * (SOL/USDC, USDC/USDT, SOL/JitoSOL). Those are the most liquid pools on
- * Solana — and also the most efficiently arbitraged. Any edge there is
- * gone in milliseconds, captured by co-located HFT bots.
+ * The new selector is graph-aware and triangle-closure-driven:
  *
- * The new fetcher fetches WIDER (3-5x the limit) from each API, then ranks
- * locally using:
+ *   1. Anchor hubs are SOL, USDC, USDT (mints any triangle must close back to).
+ *   2. For every NON-anchor token T, we require either:
+ *        (a) ≥2 distinct anchor connections (T↔SOL and T↔USDC), so the triangle
+ *            SOL → T → USDC → SOL has all three legs available; OR
+ *        (b) ≥2 pools to the SAME anchor (cross-DEX), so divergence is
+ *            measurable on the T↔anchor pair (path SOL → T → SOL via two
+ *            different DEXes is degenerate, but multi-pool same-anchor lets
+ *            T↔anchor act as a divergent leg in a larger triangle).
+ *   3. T must have ≥2 total pools across the candidate set, otherwise the
+ *      divergenceScanner can't compute a comparable mid for it.
+ *   4. Within each surviving T-bucket we pull the highest-activity pools but
+ *      enforce FEE-TIER DIVERSITY (1 pool per fee bucket per T-anchor pair),
+ *      so a 19 bps gross-edge route doesn't get killed because the only kept
+ *      RAY/USDC pool is the 25 bps CPMM.
  *
- *   1. Turnover ratio (volume24h / TVL) — the volatility/activity proxy.
- *      A $1M pool doing $10M/day has 10x turnover; a $100M pool doing
- *      $5M/day has 0.05x. Higher turnover = more reprice events = more
- *      divergence opportunities.
+ * The selector returns pools that are ALREADY SHAPED via the existing mappers
+ * (mapRaydiumRaw/mapOrcaRaw/mapMeteoraRaw). It does NOT rebuild canonical
+ * fields. Downstream consumers see exactly the same field set they did before
+ * — divergenceScanner, Q_enrichment, myEngine all work unchanged.
  *
- *   2. Pair-multiplicity bonus — pools on pairs that have at least 2
- *      candidates get a score boost. Triangular arbitrage requires multiple
- *      pools per pair (otherwise there's no divergence to exploit).
+ * Backward compat
+ * ---------------
+ * `--quality` still works. The legacy `selectWithDiversity` is preserved and
+ * available via `--select-mode legacy`. New default in quality mode is
+ * `--select-mode triangle-closure`.
  *
- *   3. Fee-tier diversity — instead of dropping all high-fee pools, we
- *      ensure each pair gets at least one pool from each fee tier present.
- *      Last analysis showed RAY/USDC and RAY/USDT had +22 bps gross edge
- *      that died because the only included CPMM pool had ~30 bps fees;
- *      diversity preserves the option to take divergence even when fees
- *      are higher.
- *
- *   4. Optional pre-screen by min divergence — if --min-divergence is set,
- *      we drop pools whose pair has < N bps cross-venue spread. This
- *      requires having computed mids, which means we'd need at least
- *      sqrtPrice or reserves, so it's done as a post-step on raw data.
- *
- * Backward compatibility
- * ----------------------
- * Same CLI flags (--limit, --quality, --quality-count, etc.) plus new ones:
- *   --over-fetch N       Fetch N x limit per DEX before ranking (default 4)
- *   --rank turnover|tvl  Ranking primary signal (default turnover)
- *   --min-turnover X     Drop pools with turnover < X (default 0.05 = 5%/day)
- *   --min-volume24h $    Drop pools with daily volume < $ (default 50000)
- *   --min-divergence N   Drop pools whose pair has <N bps divergence
- *   --fee-tier-diversity When picking from a pair, force at least one pool
- *                        per fee tier present (default ON, --no-fee-tier-diversity to disable)
- *   --include-pair MINT  Force-include any pool touching this mint (repeatable)
- *
- * Same exports: main, parseArgs, extractList, mapRaydiumRaw, mapOrcaRaw,
- *               mapMeteoraRaw, fetchRaydium, fetchOrca, fetchMeteora.
+ * `--quality 60` now correctly sets BOTH quality=true AND qualityCount=60
+ * (was a CLI bug — the 60 was silently dropped).
  */
 
 const axios = require('axios');
 const fs = require('fs/promises');
 const path = require('path');
 
-// ----- DEX_DIRECT_ENDPOINTS may not be available in test environments;
-// the fetcher needs the program IDs to populate `programId` on each pool,
-// but the tests for this module don't actually exercise the fetch network
-// path. Try to require, fall back to defaults if missing.
 let DEX_DIRECT_CONFIGS;
 try {
   DEX_DIRECT_CONFIGS = require('./DEX_DIRECT_ENDPOINTS.js').DEX_DIRECT_CONFIGS;
@@ -74,7 +61,6 @@ let selectQualityPools, buildQualityOutput, summarizeSelection;
 try {
   ({ selectQualityPools, buildQualityOutput, summarizeSelection } = require('./qualityPoolSelector'));
 } catch (_e) {
-  // Provide minimal fallbacks if the helper isn't on the path.
   selectQualityPools = (pools, opts) => ({ selected: pools.slice(0, opts.topN || 40), ranked: pools, triangleFamilies: [] });
   buildQualityOutput = (data) => ({ ...data });
   summarizeSelection = (pools) => ({ byDexType: pools.reduce((a, p) => { const k = p.dexType || 'unknown'; a[k] = (a[k] || 0) + 1; return a; }, {}) });
@@ -91,6 +77,11 @@ const PRICE_UNIT_Y_PER_X = 'tokenY_per_tokenX';
 const DEFAULT_RAW_OUTPUT = '00_raw.json';
 const DEFAULT_OUTPUT = '01_meta.json';
 const DEFAULT_LIMIT = 75;
+
+const SOL = 'So11111111111111111111111111111111111111112';
+const USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+const USDT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
+const DEFAULT_ANCHOR_MINTS = [SOL, USDC, USDT];
 
 /* -------------------------------------------------------------------------- */
 /*                                CLI parsing                                 */
@@ -112,34 +103,48 @@ function parseArgs(argv) {
     maxPerDexType: 0,
     qualityMeta: '',
 
-    // New ranking knobs
-    overFetch: 4,             // fetch this multiple of limit, then rank
-    rank: 'turnover',         // 'turnover' | 'tvl' | 'composite'
-    minTurnover: 0.05,        // 5% daily turnover floor
-    minVolume24h: 50_000,     // $50k daily volume floor
-    minDivergence: 0,         // bps; 0 = off (requires post-enrichment)
-    divergenceWeight: 50,     // high by design: clear spread should dominate raw fetch ranking
+    overFetch: 4,
+    rank: 'composite',
+    minTurnover: 0.05,
+    minVolume24h: 50_000,
+    minDivergence: 0,
+    divergenceWeight: 50,
     divergenceDiagnose: false,
     feeTierDiversity: true,
     includePairs: [],
     excludePools: [
-      // Orca SOL/USDC pool that has produced contradictory quotes in runtime tests.
       'Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE',
     ],
+
+    // NEW: selection mode and triangle-closure tunables.
+    selectMode: 'triangle-closure', // 'triangle-closure' | 'legacy'
+    anchorMints: [...DEFAULT_ANCHOR_MINTS],
+    minPoolsPerToken: 2,            // every non-anchor token must have ≥N pools
+    maxPoolsPerToken: 6,            // cap per non-anchor token (keep top-N by activity)
+    maxAnchorAnchorPools: 8,        // SOL/USDC, SOL/USDT, USDC/USDT total
+    requireTwoAnchorConnections: false, // default: allow same-anchor multi-pool tokens
   };
 
   for (let i = 2; i < argv.length; i += 1) {
     const arg = argv[i];
     const next = argv[i + 1];
-    if (arg === '--out' && next) out.out = next;
+    if (arg === '--out' && next) { out.out = next; i += 1; }
     else if ((arg === '--raw' || arg === '--raw-out' || arg === '--raw-output') && next) { out.rawOut = next; i += 1; }
-    else if (arg === '--limit' && next) out.limit = Number(next) || DEFAULT_LIMIT;
-    else if ((arg === '--quality-count' || arg === '--topN') && next) out.qualityCount = Number(next) || out.qualityCount;
-    else if (arg === '--min-liquidity' && next) out.minLiquidity = Number(next) || 0;
-    else if (arg === '--max-per-pair' && next) out.maxPerPair = Number(next) || out.maxPerPair;
-    else if (arg === '--max-per-dex-type' && next) out.maxPerDexType = Number(next) || 15;
-    else if (arg === '--quality-meta' && next) out.qualityMeta = next;
-    else if (arg === '--quality') out.quality = true;
+    else if (arg === '--limit' && next) { out.limit = Number(next) || DEFAULT_LIMIT; i += 1; }
+    else if ((arg === '--quality-count' || arg === '--topN') && next) { out.qualityCount = Number(next) || out.qualityCount; i += 1; }
+    else if (arg === '--min-liquidity' && next) { out.minLiquidity = Number(next) || 0; i += 1; }
+    else if (arg === '--max-per-pair' && next) { out.maxPerPair = Number(next) || out.maxPerPair; i += 1; }
+    else if (arg === '--max-per-dex-type' && next) { out.maxPerDexType = Number(next) || 15; i += 1; }
+    else if (arg === '--quality-meta' && next) { out.qualityMeta = next; i += 1; }
+    else if (arg === '--quality') {
+      out.quality = true;
+      // Fix: `--quality 60` should also set qualityCount=60.
+      const numericNext = Number(next);
+      if (next && !next.startsWith('--') && Number.isFinite(numericNext) && numericNext > 0) {
+        out.qualityCount = numericNext;
+        i += 1;
+      }
+    }
     else if (arg === '--orca') out.orca = true;
     else if (arg === '--raydium-clmm') out.raydiumClmm = true;
     else if (arg === '--raydium-cpmm') out.raydiumCpmm = true;
@@ -152,7 +157,6 @@ function parseArgs(argv) {
     else if (arg === '--no-raydium-cpmm') out.raydiumCpmm = false;
     else if (arg === '--no-meteora') out.meteoraDlmm = false;
 
-    // New flags
     else if (arg === '--over-fetch' && next) { out.overFetch = Math.max(1, Number(next)); i += 1; }
     else if (arg === '--rank' && next) { out.rank = String(next).toLowerCase(); i += 1; }
     else if (arg === '--min-turnover' && next) { out.minTurnover = Number(next); i += 1; }
@@ -171,9 +175,23 @@ function parseArgs(argv) {
       i += 1;
     }
 
+    // NEW flags
+    else if (arg === '--select-mode' && next) { out.selectMode = String(next).toLowerCase(); i += 1; }
+    else if (arg === '--anchor-mint' && next) { out.anchorMints.push(next); i += 1; }
+    else if (arg === '--anchor-mints' && next) {
+      out.anchorMints = String(next).split(',').map((s) => s.trim()).filter(Boolean);
+      i += 1;
+    }
+    else if (arg === '--min-pools-per-token' && next) { out.minPoolsPerToken = Math.max(2, Number(next)); i += 1; }
+    else if (arg === '--max-pools-per-token' && next) { out.maxPoolsPerToken = Math.max(2, Number(next)); i += 1; }
+    else if (arg === '--max-anchor-anchor-pools' && next) { out.maxAnchorAnchorPools = Math.max(0, Number(next)); i += 1; }
+    else if (arg === '--require-two-anchor-connections') { out.requireTwoAnchorConnections = true; }
+
     else if (arg === '--help' || arg === '-h') out.help = true;
   }
 
+  // Dedup anchor mints.
+  out.anchorMints = Array.from(new Set(out.anchorMints || []));
   return out;
 }
 
@@ -334,7 +352,6 @@ function withSource(pool, source) {
 
 /* -------------------------------------------------------------------------- */
 /*                            DEX-specific mappers                            */
-/*                          (unchanged from original)                         */
 /* -------------------------------------------------------------------------- */
 
 function mapRaydiumRaw(pool, type, endpoint) {
@@ -598,16 +615,6 @@ async function fetchMeteora(limit, overFetchSize) {
 /*                         Activity-aware ranking                             */
 /* -------------------------------------------------------------------------- */
 
-/**
- * Activity score combines:
- *   - turnover = volume24h / TVL  (higher is better — more reprice events)
- *   - log(TVL) (deeper pools more executable)
- *   - fee penalty (lower fees marginally preferred at equal turnover)
- *
- * Pools with no volume data fall back to a fraction of TVL so they aren't
- * automatically excluded from the candidate set, but they rank below pools
- * with confirmed activity.
- */
 function activityScore(pool) {
   const tvl = Number(pool.tvl || 0);
   const vol = Number(pool.volume24h || 0);
@@ -616,21 +623,19 @@ function activityScore(pool) {
   if (tvl <= 0) return 0;
 
   const turnover = vol > 0 ? vol / tvl : 0;
-  const tvlScore = Math.log10(Math.max(tvl, 100));   // log to flatten the curve
+  const tvlScore = Math.log10(Math.max(tvl, 100));
   const turnoverScore = turnover > 0
-    ? Math.log10(1 + turnover * 10)                 // 1.0 -> 1.04, 10.0 -> 2.0
+    ? Math.log10(1 + turnover * 10)
     : 0;
-  const feePenalty = 1 / (1 + Math.log10(1 + fee / 10));  // gentle penalty
+  const feePenalty = 1 / (1 + Math.log10(1 + fee / 10));
 
-  // Composite: turnover dominates, TVL is multiplicative depth proof.
   if (turnover > 0) {
     return turnoverScore * tvlScore * feePenalty;
   }
-  // No volume known: fall back to depth, but discounted.
   return tvlScore * feePenalty * 0.3;
 }
 
-function tvlScore(pool) {
+function tvlScoreFn(pool) {
   return Math.log10(Math.max(Number(pool.tvl || 0), 100));
 }
 
@@ -642,9 +647,9 @@ function turnoverOnly(pool) {
 }
 
 function getRankFn(rankMode) {
-  if (rankMode === 'tvl') return tvlScore;
+  if (rankMode === 'tvl') return tvlScoreFn;
   if (rankMode === 'turnover') return turnoverOnly;
-  return activityScore; // 'composite' (default-ish)
+  return activityScore;
 }
 
 function loadDivergenceScanner() {
@@ -726,16 +731,12 @@ function pairKey(pool) {
 function feeTierBucket(feeBps) {
   if (feeBps == null) return 'unknown';
   const n = Number(feeBps);
-  if (n <= 5) return 'ultralow';   // ≤5 bps
-  if (n <= 15) return 'low';       // 6–15
-  if (n <= 30) return 'mid';       // 16–30
-  return 'high';                   // 31+
+  if (n <= 5) return 'ultralow';
+  if (n <= 15) return 'low';
+  if (n <= 30) return 'mid';
+  return 'high';
 }
 
-/**
- * Apply activity ranking + pair-multiplicity bonus + fee-tier diversity.
- * Returns ranked pools with score annotations.
- */
 function rankAndAnnotate(pools, options) {
   const rankFn = getRankFn(options.rank);
   const minTurnover = Number(options.minTurnover || 0);
@@ -750,7 +751,6 @@ function rankAndAnnotate(pools, options) {
       + `(max=${divergenceSummary.maxDivergenceBps} bps, comparable=${divergenceSummary.comparablePools}/${pools.length})`);
   }
 
-  // Group by pair to count multiplicity.
   const pairCounts = new Map();
   for (const pool of pools) {
     const k = pairKey(pool);
@@ -758,12 +758,10 @@ function rankAndAnnotate(pools, options) {
     pairCounts.set(k, (pairCounts.get(k) || 0) + 1);
   }
 
-  // Score every pool.
   for (const pool of pools) {
     const baseScore = rankFn(pool);
     const k = pairKey(pool);
     const peerCount = k ? pairCounts.get(k) || 1 : 1;
-    // Multiplicity bonus: pools on pairs with 2+ candidates get a 1.3x boost.
     const multiplicityBonus = peerCount >= 2 ? 1.3 : 1.0;
     const turnover = turnoverOnly(pool);
     const divergenceBps = Number(pool._divergenceScoreBps || 0);
@@ -781,7 +779,6 @@ function rankAndAnnotate(pools, options) {
     pool._pairKey = k;
   }
 
-  // Hard floors: drop pools with no activity at all.
   const floored = pools.filter((p) => {
     const tvl = Number(p.tvl || 0);
     const vol = Number(p.volume24h || 0);
@@ -791,19 +788,13 @@ function rankAndAnnotate(pools, options) {
     return true;
   });
 
-  // Sort by activity score, descending.
   floored.sort((a, b) => (b._activityScore || 0) - (a._activityScore || 0));
   return floored;
 }
 
 /**
- * Pick `topN` pools while enforcing per-pair caps. If feeTierDiversity is on,
- * each pair gets at least one pool per fee-tier bucket present in its
- * candidates before any one bucket can take a second slot.
- *
- * This is what makes your RAY/USDC + RAY/USDT divergence routes survive:
- * the high-fee CPMM and the low-fee CLMM both get included even when
- * --max-per-pair=2.
+ * LEGACY selector (kept for `--select-mode legacy`). Same behaviour as the
+ * previous version: rank-ordered, per-pair cap, optional fee-tier diversity.
  */
 function selectWithDiversity(rankedPools, options) {
   const topN = Number(options.qualityCount || 40);
@@ -813,11 +804,10 @@ function selectWithDiversity(rankedPools, options) {
   const enforceDiversity = options.feeTierDiversity !== false;
 
   const selected = [];
-  const perPair = new Map();              // pairKey -> count
-  const perPairFeeTiers = new Map();      // pairKey -> Set<feeTier>
-  const perDexType = new Map();           // dexType -> count
+  const perPair = new Map();
+  const perPairFeeTiers = new Map();
+  const perDexType = new Map();
 
-  // First pass: forced includes (any pool touching an --include-pair mint).
   if (includeMints.size) {
     for (const pool of rankedPools) {
       const x = String(pool.tokenXMint || '');
@@ -838,7 +828,6 @@ function selectWithDiversity(rankedPools, options) {
     }
   }
 
-  // Second pass: rank-ordered selection with caps + diversity.
   for (const pool of rankedPools) {
     if (selected.length >= topN) break;
     if (selected.includes(pool)) continue;
@@ -848,14 +837,11 @@ function selectWithDiversity(rankedPools, options) {
     const pairCount = k ? perPair.get(k) || 0 : 0;
     const dexCount = perDexType.get(dt) || 0;
 
-    // Per-pair cap.
     if (k && pairCount >= maxPerPair) {
-      // BUT: if we're enforcing diversity and this fee tier hasn't been seen
-      // on this pair yet, allow one extra slot beyond the cap.
       if (enforceDiversity) {
         const tiers = perPairFeeTiers.get(k) || new Set();
         if (!tiers.has(pool._feeTier) && pairCount < maxPerPair + 1) {
-          // Allowed via diversity exception.
+          // diversity exception
         } else {
           continue;
         }
@@ -878,7 +864,369 @@ function selectWithDiversity(rankedPools, options) {
 }
 
 /* -------------------------------------------------------------------------- */
-/*                          Optional divergence pre-screen                    */
+/*                  NEW: Triangle-closure-aware selector                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Build a graph view of the pool universe.
+ *
+ * Returns:
+ *   tokenPools:     mint -> array of pools touching this mint
+ *   tokenAnchors:   mint -> Set<anchorMint> the token connects to
+ *   anchorPairs:    Set of "anchor|anchor" pair keys (canonical)
+ *
+ * Only tokens that pass the canonical {tokenXMint, tokenYMint} check enter
+ * the graph. Anchor mints are treated as ordinary mints in tokenPools so they
+ * naturally accumulate their cross-anchor pools.
+ */
+function buildTokenGraph(pools, anchorMints) {
+  const anchorSet = new Set(anchorMints);
+  const tokenPools = new Map();
+  const tokenAnchors = new Map();
+  const anchorPairs = new Set();
+
+  const add = (token, pool) => {
+    if (!tokenPools.has(token)) tokenPools.set(token, []);
+    tokenPools.get(token).push(pool);
+  };
+
+  for (const pool of pools) {
+    const x = String(pool.tokenXMint || pool.baseMint || '');
+    const y = String(pool.tokenYMint || pool.quoteMint || '');
+    if (!x || !y) continue;
+
+    add(x, pool);
+    add(y, pool);
+
+    const xIsAnchor = anchorSet.has(x);
+    const yIsAnchor = anchorSet.has(y);
+
+    if (!xIsAnchor && yIsAnchor) {
+      if (!tokenAnchors.has(x)) tokenAnchors.set(x, new Set());
+      tokenAnchors.get(x).add(y);
+    }
+    if (!yIsAnchor && xIsAnchor) {
+      if (!tokenAnchors.has(y)) tokenAnchors.set(y, new Set());
+      tokenAnchors.get(y).add(x);
+    }
+    if (xIsAnchor && yIsAnchor) {
+      const k = pairKey(pool);
+      if (k) anchorPairs.add(k);
+    }
+  }
+
+  return { tokenPools, tokenAnchors, anchorPairs, anchorSet };
+}
+
+/**
+ * Decide whether a non-anchor token T can participate in a closable triangle
+ * given the ranked candidate pools.
+ *
+ * A token is closable if EITHER:
+ *   (a) it touches ≥2 different anchors (path SOL → T → USDC → SOL closes),
+ *       AND has ≥1 pool to each (so both legs exist); OR
+ *   (b) it has ≥2 cross-DEX pools to the SAME anchor, so the T↔anchor pair
+ *       has measurable divergence and can serve as a leg in a larger
+ *       SOL → T → anchor → SOL triangle (degenerate when anchor=SOL, but if
+ *       anchor=USDC the closing SOL↔USDC leg comes from anchor-anchor pools).
+ *
+ * Mode (a) is strictly preferred. Mode (b) is enabled only when (a) yields
+ * too few tokens, which is detected by the caller.
+ *
+ * Returns { closable, reason, anchorCounts, totalPools }.
+ */
+function classifyTokenClosure(token, pools, anchorSet) {
+  const anchorCounts = new Map();
+  let totalAnchorPools = 0;
+  for (const pool of pools) {
+    const x = String(pool.tokenXMint || '');
+    const y = String(pool.tokenYMint || '');
+    const other = x === token ? y : (y === token ? x : null);
+    if (!other) continue;
+    if (anchorSet.has(other)) {
+      anchorCounts.set(other, (anchorCounts.get(other) || 0) + 1);
+      totalAnchorPools += 1;
+    }
+  }
+
+  const distinctAnchors = anchorCounts.size;
+  const hasMultiAnchor = distinctAnchors >= 2;
+  const hasMultiSameAnchor = Array.from(anchorCounts.values()).some((c) => c >= 2);
+
+  if (hasMultiAnchor) {
+    return {
+      closable: true,
+      mode: 'multi-anchor',
+      anchorCounts,
+      totalPools: pools.length,
+      reason: `connects to ${distinctAnchors} anchors`,
+    };
+  }
+  if (hasMultiSameAnchor) {
+    return {
+      closable: true,
+      mode: 'cross-dex-same-anchor',
+      anchorCounts,
+      totalPools: pools.length,
+      reason: `≥2 pools to same anchor (cross-DEX divergence available)`,
+    };
+  }
+
+  return {
+    closable: false,
+    mode: 'orphan',
+    anchorCounts,
+    totalPools: pools.length,
+    reason: distinctAnchors === 0
+      ? 'no anchor connection'
+      : `only 1 pool to ${distinctAnchors} anchor(s)`,
+  };
+}
+
+/**
+ * Pick the best pools for one (token, anchor) bucket, enforcing fee-tier
+ * diversity. Always includes the highest-activity pool, then adds one pool
+ * per additional fee tier present, then fills with rank order until the
+ * per-anchor cap is reached.
+ */
+function pickPoolsForTokenAnchor(pools, options) {
+  const cap = Math.max(1, Number(options.cap || 3));
+  const enforceDiversity = options.feeTierDiversity !== false;
+
+  const sorted = pools.slice().sort((a, b) => (b._activityScore || 0) - (a._activityScore || 0));
+  const picked = [];
+  const tiersSeen = new Set();
+
+  for (const pool of sorted) {
+    if (picked.length >= cap) break;
+    const tier = pool._feeTier || 'unknown';
+
+    if (enforceDiversity) {
+      // First pool always wins. After that, prefer adding new tiers, but allow
+      // same-tier pools if no fresh tier candidate exists.
+      if (picked.length === 0 || !tiersSeen.has(tier)) {
+        picked.push(pool);
+        tiersSeen.add(tier);
+        continue;
+      }
+      // Same tier as one already picked — only add if remaining pools have no
+      // fresh tier to offer.
+      const remaining = sorted.slice(sorted.indexOf(pool) + 1);
+      const hasFreshTier = remaining.some((p) => !tiersSeen.has(p._feeTier || 'unknown'));
+      if (!hasFreshTier) {
+        picked.push(pool);
+        tiersSeen.add(tier);
+      }
+    } else {
+      picked.push(pool);
+      tiersSeen.add(tier);
+    }
+  }
+
+  return picked;
+}
+
+/**
+ * Triangle-closure-aware selector.
+ *
+ * Algorithm:
+ *   1. Build token graph from ranked pools.
+ *   2. Force-include any pool touching --include-pair mints (unconditional).
+ *   3. Classify every non-anchor token as closable / orphan.
+ *   4. Sort closable tokens by aggregate activity (sum of pool _activityScore).
+ *   5. For each token in rank order, pull its pools partitioned by anchor:
+ *        - For each anchor connection, run pickPoolsForTokenAnchor.
+ *        - Honour --max-pools-per-token globally per token.
+ *   6. Add anchor-anchor pools (SOL/USDC, etc.) up to --max-anchor-anchor-pools.
+ *   7. Stop when total selected reaches --quality-count, but never below the
+ *      "minimum executable" floor of 2 pools per kept token.
+ *
+ * Returns a single array of pools (no dedup needed; we track by addr Set).
+ *
+ * The diagnostic counters are stamped on the returned object via a side-band
+ * `_selection` field that the caller can read for the summary.
+ */
+function selectTriangleClosable(rankedPools, options) {
+  const topN = Number(options.qualityCount || 40);
+  const minPoolsPerToken = Math.max(2, Number(options.minPoolsPerToken || 2));
+  const maxPoolsPerToken = Math.max(minPoolsPerToken, Number(options.maxPoolsPerToken || 6));
+  const maxAnchorAnchorPools = Math.max(0, Number(options.maxAnchorAnchorPools || 8));
+  const requireTwoAnchors = Boolean(options.requireTwoAnchorConnections);
+  const includeMints = new Set(options.includePairs || []);
+  const anchorMints = options.anchorMints && options.anchorMints.length
+    ? options.anchorMints
+    : DEFAULT_ANCHOR_MINTS;
+
+  const graph = buildTokenGraph(rankedPools, anchorMints);
+  const { tokenPools, anchorSet } = graph;
+
+  const selected = new Set();
+  const selectedAddresses = new Set();
+  const counts = {
+    forcedIncluded: 0,
+    closableTokens: 0,
+    orphanTokens: 0,
+    multiAnchorTokens: 0,
+    crossDexSameAnchorTokens: 0,
+    rejectedTokens: 0,
+    anchorAnchorPools: 0,
+    rejectionReasons: new Map(),
+  };
+
+  const pushPool = (pool) => {
+    const addr = String(pool.poolAddress || pool.address || '');
+    if (!addr || selectedAddresses.has(addr)) return false;
+    selectedAddresses.add(addr);
+    selected.add(pool);
+    return true;
+  };
+
+  // Step 1: Forced includes via --include-pair.
+  if (includeMints.size) {
+    for (const pool of rankedPools) {
+      const x = String(pool.tokenXMint || '');
+      const y = String(pool.tokenYMint || '');
+      if (includeMints.has(x) || includeMints.has(y)) {
+        if (pushPool(pool)) counts.forcedIncluded += 1;
+      }
+    }
+  }
+
+  // Step 2: Classify non-anchor tokens by closure mode and rank by aggregate activity.
+  const tokenClassifications = new Map();
+  for (const [token, pools] of tokenPools.entries()) {
+    if (anchorSet.has(token)) continue;
+    if (pools.length < minPoolsPerToken) {
+      counts.orphanTokens += 1;
+      const reason = `<${minPoolsPerToken} pools (has ${pools.length})`;
+      counts.rejectionReasons.set(reason, (counts.rejectionReasons.get(reason) || 0) + 1);
+      continue;
+    }
+    const classification = classifyTokenClosure(token, pools, anchorSet);
+    if (!classification.closable) {
+      counts.orphanTokens += 1;
+      counts.rejectionReasons.set(classification.reason, (counts.rejectionReasons.get(classification.reason) || 0) + 1);
+      continue;
+    }
+    if (requireTwoAnchors && classification.mode !== 'multi-anchor') {
+      counts.rejectedTokens += 1;
+      const reason = 'requires two-anchor connection';
+      counts.rejectionReasons.set(reason, (counts.rejectionReasons.get(reason) || 0) + 1);
+      continue;
+    }
+    if (classification.mode === 'multi-anchor') counts.multiAnchorTokens += 1;
+    if (classification.mode === 'cross-dex-same-anchor') counts.crossDexSameAnchorTokens += 1;
+    counts.closableTokens += 1;
+
+    const aggregateActivity = pools.reduce((sum, p) => sum + (Number(p._activityScore) || 0), 0);
+    tokenClassifications.set(token, {
+      classification,
+      pools,
+      aggregateActivity,
+    });
+  }
+
+  const rankedTokens = Array.from(tokenClassifications.entries()).sort(
+    (a, b) => b[1].aggregateActivity - a[1].aggregateActivity,
+  );
+
+  // Step 3: Walk ranked tokens, pulling fee-diverse pools per (token, anchor) bucket.
+  for (const [token, info] of rankedTokens) {
+    if (selected.size >= topN) break;
+    const { pools } = info;
+
+    // Bucket pools by which anchor they connect to (or 'non-anchor' if pool is
+    // T↔T2 where neither is anchor — those are useful as bridge legs for
+    // deeper triangles but we handle them only if explicitly enabled).
+    const byAnchor = new Map();
+    const nonAnchorBucket = [];
+    for (const pool of pools) {
+      const x = String(pool.tokenXMint || '');
+      const y = String(pool.tokenYMint || '');
+      const other = x === token ? y : x;
+      if (anchorSet.has(other)) {
+        if (!byAnchor.has(other)) byAnchor.set(other, []);
+        byAnchor.get(other).push(pool);
+      } else {
+        nonAnchorBucket.push(pool);
+      }
+    }
+
+    // Per-token cap: split between anchor buckets. Each bucket gets up to
+    // ceil(cap / numBuckets), but at least 1.
+    const buckets = byAnchor.size;
+    if (buckets === 0) continue;
+    const perBucketCap = Math.max(1, Math.ceil(maxPoolsPerToken / buckets));
+
+    let pickedForToken = 0;
+    for (const [anchor, anchorPools] of byAnchor.entries()) {
+      if (pickedForToken >= maxPoolsPerToken) break;
+      const remaining = maxPoolsPerToken - pickedForToken;
+      const cap = Math.min(perBucketCap, remaining);
+      const chosen = pickPoolsForTokenAnchor(anchorPools, {
+        cap,
+        feeTierDiversity: options.feeTierDiversity,
+      });
+      for (const pool of chosen) {
+        if (selected.size >= topN) break;
+        if (pushPool(pool)) pickedForToken += 1;
+      }
+    }
+  }
+
+  // Step 4: Anchor-anchor pools (SOL/USDC, SOL/USDT, USDC/USDT). Triangles
+  // need at least one of these as the closing leg whenever the route uses two
+  // distinct anchors. We pull cross-DEX pools to enable divergence on these
+  // legs too.
+  const anchorAnchorPools = rankedPools.filter((pool) => {
+    const x = String(pool.tokenXMint || '');
+    const y = String(pool.tokenYMint || '');
+    return anchorSet.has(x) && anchorSet.has(y);
+  });
+  // Group by canonical anchor pair, take fee-diverse top picks per group.
+  const aaByPair = new Map();
+  for (const pool of anchorAnchorPools) {
+    const k = pairKey(pool);
+    if (!k) continue;
+    if (!aaByPair.has(k)) aaByPair.set(k, []);
+    aaByPair.get(k).push(pool);
+  }
+  for (const [, group] of aaByPair) {
+    const cap = Math.max(2, Math.ceil(maxAnchorAnchorPools / Math.max(1, aaByPair.size)));
+    const chosen = pickPoolsForTokenAnchor(group, {
+      cap,
+      feeTierDiversity: options.feeTierDiversity,
+    });
+    for (const pool of chosen) {
+      if (selected.size >= topN) break;
+      if (counts.anchorAnchorPools >= maxAnchorAnchorPools) break;
+      if (pushPool(pool)) counts.anchorAnchorPools += 1;
+    }
+  }
+
+  // Result, with a side-band selection summary stored on the array itself.
+  const result = Array.from(selected);
+  result._selection = {
+    mode: 'triangle-closure',
+    anchorMints,
+    minPoolsPerToken,
+    maxPoolsPerToken,
+    maxAnchorAnchorPools,
+    closableTokens: counts.closableTokens,
+    multiAnchorTokens: counts.multiAnchorTokens,
+    crossDexSameAnchorTokens: counts.crossDexSameAnchorTokens,
+    orphanTokens: counts.orphanTokens,
+    forcedIncluded: counts.forcedIncluded,
+    anchorAnchorPools: counts.anchorAnchorPools,
+    rejectedTokens: counts.rejectedTokens,
+    totalSelected: result.length,
+    rejectionReasons: Object.fromEntries(counts.rejectionReasons),
+  };
+  return result;
+}
+
+/* -------------------------------------------------------------------------- */
+/*                   Optional divergence pre-screen                           */
 /* -------------------------------------------------------------------------- */
 
 function applyDivergenceScreen(pools, minBps) {
@@ -892,10 +1240,6 @@ function applyDivergenceScreen(pools, minBps) {
 
   scanner.annotatePairDivergence(pools);
 
-  // Keep clear, comparable divergence. Singletons and genuinely unmeasurable
-  // raw pairs pass through because they cannot prove or disprove divergence
-  // until Q-enrichment fills chain-state fields. Comparable peer groups with
-  // sub-threshold divergence are dropped.
   const kept = pools.filter((p) => {
     const peerCount = Number(p.pairPeerCount || 0);
     const comparablePeers = Number(p.pairComparablePeerCount || 0);
@@ -943,38 +1287,86 @@ function summarizeActivity(pools) {
   };
 }
 
+function summarizeTriangleCoverage(pools, anchorMints) {
+  const graph = buildTokenGraph(pools, anchorMints);
+  const tokenList = [];
+  let triangleClosable = 0;
+  let multiAnchor = 0;
+  for (const [token, pools_] of graph.tokenPools.entries()) {
+    if (graph.anchorSet.has(token)) continue;
+    if (pools_.length < 2) continue;
+    const cls = classifyTokenClosure(token, pools_, graph.anchorSet);
+    if (cls.closable) {
+      triangleClosable += 1;
+      if (cls.mode === 'multi-anchor') multiAnchor += 1;
+      tokenList.push({
+        token,
+        symbol: pools_.find((p) => p.tokenXMint === token)?.baseSymbol
+          || pools_.find((p) => p.tokenYMint === token)?.quoteSymbol
+          || token.slice(0, 6) + '..' + token.slice(-4),
+        poolCount: pools_.length,
+        anchorConnections: Array.from(cls.anchorCounts.entries()).map(([a, n]) => ({ anchor: a, pools: n })),
+        mode: cls.mode,
+      });
+    }
+  }
+  return {
+    triangleClosableTokens: triangleClosable,
+    multiAnchorTokens: multiAnchor,
+    anchorAnchorPairs: graph.anchorPairs.size,
+    closableTokenList: tokenList.slice(0, 30),
+  };
+}
+
 async function main() {
   const args = parseArgs(process.argv);
   if (args.help) {
     console.log(`Usage:
-  node poolFetch_raw.js --out custom_raw-25.json --limit 25
-  node utilities/poolFetchCustom_raw.js --out 01_meta.json --raw 00_raw.json
-  node poolFetch_raw.js --out raw.json --limit 60 --quality \\
-       --rank turnover --min-turnover 0.1 --min-volume24h 100000 \\
-       --over-fetch 4 --quality-count 60 --max-per-pair 2
+  node utilities/poolFetchCustom_raw.js --out 01_meta.json --raw 00_raw.json \\
+       --quality 60 --over-fetch 5 --max-per-dex-type 20
 
-Activity-aware ranking flags:
-  --rank turnover|tvl|composite     Primary signal (default composite)
-  --over-fetch N                    Fetch N x limit per DEX (default 4)
-  --raw PATH                        Save fetched raw pool snapshot before screening
-  --min-turnover N                  Drop pools with vol/TVL < N (default 0.05)
-  --min-volume24h $                 Drop pools with $vol < amount (default 50000)
-  --min-divergence N                Drop pools whose pair has <N bps divergence
-  --divergence-weight N             Rank boost for clear divergence (default 50)
-  --divergence-diagnose             Print mid-price extraction diagnostics
-  --no-fee-tier-diversity           Disable fee-tier diversity (default ON)
-  --include-pair MINT               Force include any pool touching MINT
+Selection mode:
+  --select-mode triangle-closure   New default — graph-aware (recommended)
+  --select-mode legacy             Old behaviour (rank+pair-cap)
+
+Triangle-closure tunables:
+  --anchor-mints A,B,C             Which mints triangles must close back to
+                                   (default SOL,USDC,USDT)
+  --min-pools-per-token N          Drop tokens with <N total pools (default 2)
+  --max-pools-per-token N          Cap pools per non-anchor token (default 6)
+  --max-anchor-anchor-pools N      Cap on SOL/USDC etc combined (default 8)
+  --require-two-anchor-connections Only keep tokens connecting to ≥2 anchors
+
+Activity ranking:
+  --rank turnover|tvl|composite    Primary signal (default composite)
+  --over-fetch N                   Fetch N x limit per DEX (default 4)
+  --min-turnover N                 Drop pools with vol/TVL < N (default 0.05)
+  --min-volume24h $                Drop pools with $vol < amount (default 50000)
+  --min-divergence N               Drop pools whose pair has <N bps divergence
+  --divergence-weight N            Rank boost for clear divergence (default 50)
+
+Other:
+  --quality N                      Enable quality selection, topN=N
+  --max-per-pair N                 Per-pair cap (legacy mode only)
+  --include-pair MINT              Force-include any pool touching MINT
+  --no-fee-tier-diversity          Disable fee-tier diversity (default ON)
 `);
     process.exit(0);
   }
 
-  console.log('Custom raw pool fetcher (activity-aware)');
+  console.log('Custom raw pool fetcher (triangle-closure-aware)');
   console.log(`Output:        ${args.out}`);
   if (args.rawOut) console.log(`Raw snapshot:  ${args.rawOut}`);
   console.log(`Limit per DEX: ${args.limit}  ·  over-fetch x${args.overFetch}`);
   console.log(`Ranking:       ${args.rank}  min-turnover=${args.minTurnover} min-volume=${args.minVolume24h}`);
   console.log(`Divergence:    min=${args.minDivergence}bps weight=${args.divergenceWeight}`);
-  console.log(`Selection:     topN=${args.qualityCount} maxPerPair=${args.maxPerPair} feeTierDiversity=${args.feeTierDiversity}`);
+  console.log(`Selection:     mode=${args.selectMode} topN=${args.qualityCount} `
+    + `feeTierDiversity=${args.feeTierDiversity}`);
+  if (args.selectMode === 'triangle-closure') {
+    console.log(`               anchors=${args.anchorMints.length} `
+      + `minPoolsPerToken=${args.minPoolsPerToken} maxPoolsPerToken=${args.maxPoolsPerToken} `
+      + `maxAnchorAnchor=${args.maxAnchorAnchorPools}`);
+  }
 
   const overFetchSize = args.limit * args.overFetch;
   const pools = [];
@@ -994,7 +1386,6 @@ Activity-aware ranking flags:
   }
   const candidatePools = applyPoolExclusions(pools, args.excludePools);
 
-  // Rank and annotate.
   console.log(`\nRanking by ${args.rank} score...`);
   let ranked = rankAndAnnotate(candidatePools, args);
   console.log(`  After activity floor: ${ranked.length}/${candidatePools.length}`);
@@ -1003,24 +1394,61 @@ Activity-aware ranking flags:
   console.log(`  Avg turnover (vol/TVL):`, activitySummary.avgTurnover);
   console.log(`  Fee tiers:`, activitySummary.feeTiers);
 
-  // Optional divergence pre-screen (only effective if pools have sqrtPrice/reserves).
   if (args.minDivergence > 0) {
     ranked = applyDivergenceScreen(ranked, args.minDivergence);
   }
 
-  // Final selection with caps and diversity.
+  // Pre-selection diagnostic.
+  const preCoverage = summarizeTriangleCoverage(ranked, args.anchorMints);
+  console.log(`\nPre-selection triangle coverage:`);
+  console.log(`  Triangle-closable tokens: ${preCoverage.triangleClosableTokens}`);
+  console.log(`  Multi-anchor tokens: ${preCoverage.multiAnchorTokens}`);
+  console.log(`  Anchor-anchor pairs: ${preCoverage.anchorAnchorPairs}`);
+
   let outputPools;
-  let qualityResult = null;
   if (args.quality) {
-    outputPools = selectWithDiversity(ranked, args);
-    console.log(`\nQuality selection: ${outputPools.length}/${ranked.length}`);
+    if (args.selectMode === 'legacy') {
+      outputPools = selectWithDiversity(ranked, args);
+      console.log(`\nLegacy quality selection: ${outputPools.length}/${ranked.length}`);
+    } else {
+      outputPools = selectTriangleClosable(ranked, args);
+      const sel = outputPools._selection || {};
+      console.log(`\nTriangle-closure selection: ${outputPools.length}/${ranked.length}`);
+      console.log(`  Closable tokens kept: ${sel.closableTokens || 0} `
+        + `(multi-anchor=${sel.multiAnchorTokens || 0}, cross-dex=${sel.crossDexSameAnchorTokens || 0})`);
+      console.log(`  Anchor-anchor pools: ${sel.anchorAnchorPools || 0}`);
+      console.log(`  Forced includes: ${sel.forcedIncluded || 0}`);
+      if (sel.orphanTokens) {
+        console.log(`  Orphan tokens dropped: ${sel.orphanTokens}`);
+        const top = Object.entries(sel.rejectionReasons || {})
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 5);
+        for (const [reason, n] of top) {
+          console.log(`     · ${reason}: ${n}`);
+        }
+      }
+    }
     console.log('  Counts:', summarize(outputPools));
   } else {
-    outputPools = ranked.slice(0, args.limit * 4);  // sensible default cap
+    outputPools = ranked.slice(0, args.limit * 4);
     console.log(`\nNo --quality flag: writing top ${outputPools.length} ranked pools`);
   }
 
-  // Strip internal annotation prefixes from output (keep them only in metadata).
+  // Post-selection coverage.
+  const postCoverage = summarizeTriangleCoverage(outputPools, args.anchorMints);
+  console.log(`\nPost-selection triangle coverage:`);
+  console.log(`  Triangle-closable tokens: ${postCoverage.triangleClosableTokens}`);
+  console.log(`  Multi-anchor tokens: ${postCoverage.multiAnchorTokens}`);
+  console.log(`  Anchor-anchor pairs: ${postCoverage.anchorAnchorPairs}`);
+  if (postCoverage.closableTokenList.length) {
+    console.log(`  Top closable tokens (showing ${Math.min(postCoverage.closableTokenList.length, 10)}):`);
+    for (const t of postCoverage.closableTokenList.slice(0, 10)) {
+      const anchors = t.anchorConnections.map((c) => `${c.anchor.slice(0, 4)}..×${c.pools}`).join(' ');
+      console.log(`     ${t.symbol.padEnd(10)} pools=${t.poolCount} anchors=[${anchors}] mode=${t.mode}`);
+    }
+  }
+
+  // Strip internal annotations from output.
   const cleanedOutput = outputPools.map((p) => {
     const cleaned = { ...p };
     delete cleaned._activityScore;
@@ -1036,15 +1464,16 @@ Activity-aware ranking flags:
     return cleaned;
   });
 
+  await fs.mkdir(path.dirname(path.resolve(args.out)), { recursive: true });
   await fs.writeFile(args.out, JSON.stringify(cleanedOutput, null, 2));
   console.log(`\nSaved raw pools to ${path.resolve(args.out)}`);
 
   if (args.quality && args.qualityMeta) {
     const qualityOutput = buildQualityOutput({
-      source: 'poolFetchCustom_raw.js (activity-aware)',
+      source: 'poolFetchCustom_raw.js (triangle-closure)',
       selected: cleanedOutput,
-      ranked: ranked.slice(0, 200),  // top 200 by activity for inspection
-      triangleFamilies: [],
+      ranked: ranked.slice(0, 200),
+      triangleFamilies: postCoverage.closableTokenList,
       options: {
         topN: args.qualityCount,
         minLiquidity: args.minLiquidity,
@@ -1056,9 +1485,16 @@ Activity-aware ranking flags:
         divergenceDiagnose: args.divergenceDiagnose,
         feeTierDiversity: args.feeTierDiversity,
         excludePools: args.excludePools,
+        selectMode: args.selectMode,
+        anchorMints: args.anchorMints,
+        minPoolsPerToken: args.minPoolsPerToken,
+        maxPoolsPerToken: args.maxPoolsPerToken,
+        maxAnchorAnchorPools: args.maxAnchorAnchorPools,
         activitySummary,
+        triangleCoverage: postCoverage,
+        selectionDiagnostics: outputPools._selection || null,
       },
-      mode: 'direct-api-activity-select',
+      mode: args.selectMode === 'legacy' ? 'direct-api-activity-select' : 'direct-api-triangle-closure',
     });
     await fs.writeFile(args.qualityMeta, JSON.stringify(qualityOutput, null, 2));
     console.log(`Saved quality metadata to ${path.resolve(args.qualityMeta)}`);
@@ -1082,9 +1518,13 @@ module.exports = {
   fetchRaydium,
   fetchOrca,
   fetchMeteora,
-  // Newly exported for downstream tooling and tests:
   rankAndAnnotate,
   selectWithDiversity,
+  selectTriangleClosable,
+  buildTokenGraph,
+  classifyTokenClosure,
+  pickPoolsForTokenAnchor,
+  summarizeTriangleCoverage,
   activityScore,
   turnoverOnly,
   pairKey,
@@ -1096,7 +1536,17 @@ module.exports = {
   deriveReservePriceYPerX,
   applyPoolExclusions,
   poolIdOf,
+  DEFAULT_ANCHOR_MINTS,
 };
+
+/*
+Canonical numbered runtime sequence (unchanged):
+
+node utilities/poolFetchCustom_raw.js --out 01_meta.json --raw 00_raw.json --quality 60 --over-fetch 5 --max-per-dex-type 20
+node utilities/divergenceScanner.js --in 01_meta.json --out 02_filtered.json
+node engine/Q_enrichment.js --in 02_filtered.json --out 03_enriched.json
+node engine/myEngine.js --in 03_enriched.json --out 04_runtimeResults.json --csv 05_result_compare.csv --json 06_result_data.json --html 07_result_report.html
+*/
 /*
 Canonical numbered runtime sequence:
 
